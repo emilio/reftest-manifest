@@ -6,13 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum IsHttp {
     No,
     Yes { depth: usize },
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Condition {
     Simple(String),
     Neg(Box<Condition>),
@@ -25,27 +25,23 @@ fn is_binop(b: u8) -> bool {
     matches!(b, b'&' | b'|')
 }
 
-fn is_binop_or_comma(b: u8) -> bool {
-    is_binop(b) || b == b','
-}
-
-fn is_operator(b: u8) -> bool {
-    is_binop(b) || b == b'!'
-}
-
 fn find_pos_in_scope(s: &[u8], mut matches: impl FnMut(u8) -> bool) -> Option<usize> {
     let mut counter = 0;
     for (i, &b) in s.iter().enumerate() {
         if counter == 0 && matches(b) {
-            return Some(i)
+            return Some(i);
         }
         match b {
             b'(' | b'[' => counter += 1,
             b')' | b']' => counter -= 1,
-            _ => {},
+            _ => {}
         }
     }
     None
+}
+
+fn find_comma_in_scope(s: &str) -> Option<usize> {
+    find_pos_in_scope(s.as_bytes(), |b| b == b',')
 }
 
 impl Condition {
@@ -64,7 +60,10 @@ impl Condition {
             }
 
             if !is_binop(condition[0]) {
-                eprintln!("Failed to parse condition: {:?}", String::from_utf8_lossy(condition));
+                eprintln!(
+                    "Failed to parse condition: {:?}",
+                    String::from_utf8_lossy(condition)
+                );
                 break;
             }
 
@@ -107,21 +106,25 @@ impl Condition {
             b'!' => {
                 let (negated, advanced) = Self::parse_one(&condition[1..]);
                 (Self::Neg(Box::new(negated)), advanced + 1)
-            },
+            }
             b'(' => {
-                let pos = find_pos_in_scope(&condition[1..], |b| b == b')').unwrap_or(condition.len());
+                let pos = 1 + find_pos_in_scope(&condition[1..], |b| b == b')')
+                    .unwrap_or(condition.len() - 1);
                 let inner = Self::parse(&condition[1..pos]);
                 (Self::Paren(Box::new(inner)), pos + 1)
-            },
+            }
             _ => {
                 let pos = find_pos_in_scope(condition, |b| is_binop(b)).unwrap_or(condition.len());
-                (Self::Simple(String::from_utf8_lossy(&condition[0..pos]).into_owned()), pos)
+                (
+                    Self::Simple(String::from_utf8_lossy(&condition[0..pos]).into_owned()),
+                    pos,
+                )
             }
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct URange(usize, usize);
 
 impl URange {
@@ -158,8 +161,9 @@ impl URange {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Status {
+    #[allow(unused)]
     Pass,
     Fail,
     Random,
@@ -180,12 +184,16 @@ impl Status {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum TestItem {
     NeedsFocus,
+    ChaosMode,
+    WrCapture,
+    WrCaptureRef,
+    NoAutoFuzz,
     Status(Status, Option<Condition>),
     Slow(Option<Condition>),
-    Asserts(Option<Condition>, URange, URange),
+    Asserts(Option<Condition>, URange),
     Fuzzy(Option<Condition>, URange, URange),
     RequireOr(Condition, Status),
 }
@@ -216,25 +224,78 @@ fn parse_maybe_conditional(name: &str, mut item: &str) -> Result<Option<Conditio
 impl TestItem {
     fn from_str(item: &str) -> Option<Self> {
         if let Ok(condition) = parse_maybe_conditional("fails", item) {
-            return Some(TestItem::Status(Status::Fail, condition));
+            return Some(Self::Status(Status::Fail, condition));
         }
         if let Ok(condition) = parse_maybe_conditional("random", item) {
-            return Some(TestItem::Status(Status::Random, condition));
+            return Some(Self::Status(Status::Random, condition));
         }
         if let Ok(condition) = parse_maybe_conditional("skip", item) {
-            return Some(TestItem::Status(Status::Skip, condition));
+            return Some(Self::Status(Status::Skip, condition));
         }
         if let Ok(condition) = parse_maybe_conditional("silentfail", item) {
-            return Some(TestItem::Status(Status::SilentFail, condition));
+            return Some(Self::Status(Status::SilentFail, condition));
         }
         if let Ok(condition) = parse_maybe_conditional("slow", item) {
-            return Some(TestItem::Slow(condition));
+            return Some(Self::Slow(condition));
         }
-        None
+        if let Ok(arguments) = parse_function("asserts", item) {
+            let range = URange::from_str(arguments, /* require_boundary = */ false)?;
+            return Some(Self::Asserts(None, range));
+        }
+        if let Ok(arguments) = parse_function("asserts-if", item) {
+            let condition_end = find_comma_in_scope(arguments)?;
+            let condition = Condition::parse(&arguments.as_bytes()[..condition_end]);
+            let range = URange::from_str(
+                &arguments[condition_end + 1..],
+                /* require_boundary = */ false,
+            )?;
+            return Some(Self::Asserts(Some(condition), range));
+        }
+        if let Ok(arguments) = parse_function("fuzzy", item) {
+            let first_range_end = find_comma_in_scope(arguments)?;
+            let first = URange::from_str(
+                &arguments[..first_range_end],
+                /* require_boundary = */ true,
+            )?;
+            let second = URange::from_str(
+                &arguments[first_range_end + 1..],
+                /* require_boundary = */ true,
+            )?;
+            return Some(Self::Fuzzy(None, first, second));
+        }
+        if let Ok(arguments) = parse_function("fuzzy-if", item) {
+            let condition_end = find_comma_in_scope(arguments)?;
+            let condition = Condition::parse(&arguments.as_bytes()[..condition_end]);
+            let first_range_end =
+                condition_end + 1 + find_comma_in_scope(&arguments[condition_end + 1..])?;
+            let first = URange::from_str(
+                &arguments[condition_end + 1..first_range_end],
+                /* require_boundary = */ true,
+            )?;
+            let second = URange::from_str(
+                &arguments[first_range_end + 1..],
+                /* require_boundary = */ true,
+            )?;
+            return Some(Self::Fuzzy(Some(condition), first, second));
+        }
+        if let Ok(arguments) = parse_function("require-or", item) {
+            let condition_end = find_comma_in_scope(arguments)?;
+            let condition = Condition::parse(&arguments.as_bytes()[..condition_end]);
+            let status = Status::from_str(&arguments[condition_end + 1..])?;
+            return Some(Self::RequireOr(condition, status));
+        }
+        Some(match item {
+            "needs-focus" => Self::NeedsFocus,
+            "chaos-mode" => Self::ChaosMode,
+            "wr-capture" => Self::WrCapture,
+            "wr-capture-ref" => Self::WrCaptureRef,
+            "noautofuzz" => Self::NoAutoFuzz,
+            _ => return None,
+        })
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum TestType {
     Script(PathBuf),
     Load(PathBuf),
@@ -243,6 +304,7 @@ pub enum TestType {
     Print(PathBuf, PathBuf),
 }
 
+#[derive(Debug, PartialEq)]
 struct Line<'a> {
     entry: Option<Entry>,
     #[allow(unused)]
@@ -297,7 +359,10 @@ fn parse_manifest_line<'a>(mut line: &'a str) -> Result<Line<'a>, &'static str> 
     let items: Vec<_> = line.split_ascii_whitespace().collect();
     let mut items: &[_] = &*items;
     if items.is_empty() {
-        return Ok(Line { entry: None, comment });
+        return Ok(Line {
+            entry: None,
+            comment,
+        });
     }
 
     if items.len() == 1 {
@@ -416,7 +481,12 @@ pub fn parse_manifest(path: &Path) -> Result<Vec<Entry>, &'static str> {
                 }
             }
             Err(error) => {
-                eprintln!("Failed to parse {}:{}: {}", path.display(), line_number, error);
+                eprintln!(
+                    "Failed to parse {}:{}: {}",
+                    path.display(),
+                    line_number,
+                    error
+                );
             }
         }
     }
@@ -424,7 +494,7 @@ pub fn parse_manifest(path: &Path) -> Result<Vec<Entry>, &'static str> {
     Ok(entries)
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Entry {
     /// An `include foo.list` statement, with out the entries from parsing that
     /// manifest.
@@ -434,3 +504,28 @@ pub enum Entry {
     Test(Vec<TestItem>, IsHttp, TestType),
 }
 
+#[test]
+fn test_parsing() {
+    assert_eq!(
+        parse_manifest_line("fuzzy-if(foo&&!(bar||baz||/^aarch64-msvc/.test(xulRuntime.XPCOMABI)),0-3,5-6) == foo.html bar.html"),
+        Ok(Line {
+            entry: Some(Entry::Test(
+                vec![TestItem::Fuzzy(
+                    Some(Condition::And(vec![
+                        Condition::Simple("foo".into()),
+                        Condition::Neg(Box::new(Condition::Paren(Box::new(Condition::Or(vec![
+                            Condition::Simple("bar".into()),
+                            Condition::Simple("baz".into()),
+                            Condition::Simple("/^aarch64-msvc/.test(xulRuntime.XPCOMABI)".into()),
+                        ])))))
+                    ])),
+                    URange(0, 3),
+                    URange(5, 6),
+                )],
+                IsHttp::No,
+                TestType::Equals(PathBuf::from("foo.html"), PathBuf::from("bar.html")),
+            )),
+            comment: "",
+        })
+    )
+}

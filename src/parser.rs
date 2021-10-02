@@ -4,7 +4,7 @@
 //!
 //! https://searchfox.org/mozilla-central/rev/79f93e7a8b9aa1903f1349f2dd46fb71596f2ae9/layout/tools/reftest/manifest.jsm#86
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use retain_mut::RetainMut;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -281,6 +281,10 @@ fn simplify_cond(cond: &mut Option<Condition>) -> IsRedundant {
 }
 
 impl TestItem {
+    fn serialize(&self, _dest: &mut String) {
+        todo!()
+    }
+
     // Returns whether the item is completely redundant.
     fn simplify(&mut self) -> IsRedundant {
         match *self {
@@ -433,11 +437,17 @@ pub enum TestType {
     Print(PathBuf, PathBuf),
 }
 
+impl TestType {
+    fn serialize(&self, _dest: &mut String) {
+        todo!()
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
-struct Line<'a> {
-    entry: Option<Entry>,
+pub struct Line<'a> {
+    pub entry: Option<Entry>,
     #[allow(unused)]
-    comment: &'a str,
+    pub comment: &'a str,
 }
 
 impl<'a> Line<'a> {
@@ -445,6 +455,15 @@ impl<'a> Line<'a> {
         if let Some(ref mut entry) = self.entry {
             entry.simplify();
         }
+    }
+
+    pub fn serialize(&self) -> String {
+        let mut result = String::new();
+        if let Some(ref entry) = self.entry {
+            entry.serialize(&mut result);
+        }
+        result.push_str(self.comment);
+        result
     }
 }
 
@@ -486,7 +505,7 @@ fn maybe_parse_http(item: &str) -> Option<usize> {
     return Some(depth);
 }
 
-fn parse_manifest_line<'a>(mut line: &'a str) -> Result<Line<'a>, &'static str> {
+pub fn parse_manifest_line<'a>(mut line: &'a str) -> Result<Line<'a>, &'static str> {
     line = line.trim();
     let mut comment = "";
     if line.starts_with('#') {
@@ -596,45 +615,6 @@ fn parse_manifest_line<'a>(mut line: &'a str) -> Result<Line<'a>, &'static str> 
     })
 }
 
-pub fn parse_manifest(path: &Path) -> Result<Vec<Entry>, &'static str> {
-    use std::io::BufRead;
-
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(..) => return Err("Failed to open file"),
-    };
-
-    let mut entries = vec![];
-    let reader = std::io::BufReader::new(file);
-    let mut line_number = 0;
-    for line in reader.lines() {
-        let line = line.expect("Error reading line");
-        line_number += 1;
-        match parse_manifest_line(&line) {
-            Ok(mut line) => {
-                line.simplify();
-                if let Some(entry) = line.entry {
-                    if let Entry::Include(_, ref nested_path) = entry {
-                        let p = path.parent().unwrap().join(nested_path);
-                        parse_manifest(&p).unwrap();
-                    }
-                    entries.push(entry);
-                }
-            }
-            Err(error) => {
-                panic!(
-                    "Failed to parse {}:{}: {}",
-                    path.display(),
-                    line_number,
-                    error
-                );
-            }
-        }
-    }
-
-    Ok(entries)
-}
-
 fn simplify_items(items: &mut Vec<TestItem>) {
     items.retain_mut(|item| item.simplify() == IsRedundant::No)
 }
@@ -649,6 +629,15 @@ pub enum Entry {
     Test(Vec<TestItem>, IsHttp, TestType),
 }
 
+fn serialize_items(items: &[TestItem], dest: &mut String) {
+    for (i, item) in items.iter().enumerate() {
+        if i != 0 {
+            dest.push(' ');
+        }
+        item.serialize(dest);
+    }
+}
+
 impl Entry {
     fn simplify(&mut self) {
         match *self {
@@ -656,6 +645,52 @@ impl Entry {
             Self::Test(ref mut items, ..) |
             Self::Include(ref mut items, ..) => simplify_items(items),
             Self::UrlPrefix(..) => {},
+        }
+    }
+
+    fn serialize(&self, dest: &mut String) {
+        match *self {
+            Self::Defaults(ref items) => {
+                dest.push_str("defaults");
+                if !items.is_empty() {
+                    dest.push(' ');
+                    serialize_items(&items, dest);
+                }
+            }
+            Self::Include(ref items, ref path) => {
+                if !items.is_empty() {
+                    serialize_items(&items, dest);
+                    dest.push(' ');
+                }
+                dest.push_str("include ");
+                dest.push_str(path.to_str().expect("should be able to serialize a path that came from a string"));
+            },
+            Self::UrlPrefix(ref prefix) => {
+                dest.push_str("url-prefix ");
+                dest.push_str(prefix)
+            },
+            Self::Test(ref items, ref is_http, ref test_type) => {
+                if !items.is_empty() {
+                    serialize_items(&items, dest);
+                    dest.push(' ');
+                }
+                if let IsHttp::Yes { depth } = *is_http {
+                    if depth == 0 {
+                        dest.push_str("HTTP")
+                    } else {
+                        dest.push_str("HTTP(");
+                        for i in 0..depth {
+                            if i != 0 {
+                                dest.push('/');
+                            }
+                            dest.push_str("..");
+                        }
+                        dest.push(')');
+                    }
+                    dest.push(' ');
+                }
+                test_type.serialize(dest);
+            }
         }
     }
 }

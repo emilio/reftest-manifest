@@ -5,20 +5,74 @@
 //! https://searchfox.org/mozilla-central/rev/79f93e7a8b9aa1903f1349f2dd46fb71596f2ae9/layout/tools/reftest/manifest.jsm#86
 
 use std::path::{Path, PathBuf};
+use retain_mut::RetainMut;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum IsHttp {
     No,
     Yes { depth: usize },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Condition {
     Simple(String),
     Neg(Box<Condition>),
     Paren(Box<Condition>),
     And(Vec<Condition>),
     Or(Vec<Condition>),
+}
+
+impl Condition {
+    fn known_value(&self) -> Option<bool> {
+        match *self {
+            Self::Simple(ref s) => {
+                if s == "true" || s == "webrender" {
+                    return Some(true);
+                }
+                if s == "false" {
+                    return Some(false);
+                }
+                None
+            },
+            _ => None,
+        }
+    }
+
+    fn simplify(&mut self) {
+        match *self {
+            Self::Simple(..) => return,
+            Self::Neg(ref mut inner) => {
+                inner.simplify();
+                if let Some(v) = inner.known_value() {
+                    *self = Self::Simple(if v { "false" } else { "true" }.into())
+                }
+            },
+            Self::Paren(ref mut inner) => {
+                inner.simplify();
+                if let Some(v) = inner.known_value() {
+                    *self = Self::Simple(if v { "true" } else { "false" }.into())
+                }
+            },
+            Self::Or(ref mut conds) => {
+                conds.retain_mut(|cond| {
+                    cond.simplify();
+                    cond.known_value() != Some(false)
+                });
+                if conds.is_empty() {
+                    *self = Self::Simple("false".into());
+                }
+            },
+            Self::And(ref mut conds) => {
+                conds.retain_mut(|cond| {
+                    cond.simplify();
+                    cond.known_value() != Some(true)
+                });
+                if conds.is_empty() {
+                    *self = Self::Simple("true".into());
+                }
+            },
+        }
+    }
 }
 
 fn is_binop(b: u8) -> bool {
@@ -48,6 +102,7 @@ impl Condition {
     fn parse(mut condition: &[u8]) -> Self {
         let mut ret = vec![];
         let mut operator = None;
+        let original = condition;
         loop {
             {
                 let (parsed, advanced) = Self::parse_one(condition);
@@ -62,7 +117,7 @@ impl Condition {
             if !is_binop(condition[0]) {
                 eprintln!(
                     "Failed to parse condition: {:?}",
-                    String::from_utf8_lossy(condition)
+                    String::from_utf8_lossy(original)
                 );
                 break;
             }
@@ -74,7 +129,10 @@ impl Condition {
 
             if let Some(op) = operator {
                 if op != condition[0] {
-                    eprintln!("Operator conflict: {}", condition[0]);
+                    eprintln!(
+                        "Operator conflict in {}",
+                        String::from_utf8_lossy(original)
+                    );
                     break;
                 }
             } else {
@@ -124,7 +182,7 @@ impl Condition {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct URange(usize, usize);
 
 impl URange {
@@ -161,11 +219,11 @@ impl URange {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Status {
     #[allow(unused)]
     Pass,
-    Fail,
+    Fails,
     Random,
     Skip,
     SilentFail,
@@ -175,7 +233,7 @@ impl Status {
     fn from_str(s: &str) -> Option<Status> {
         // Pass is default.
         Some(match s {
-            "fail" => Status::Fail,
+            "fails" => Status::Fails,
             "random" => Status::Random,
             "skip" => Status::Skip,
             "silentfail" => Status::SilentFail,
@@ -184,18 +242,71 @@ impl Status {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
+pub enum PrefItemLocation {
+    Test,
+    Ref,
+    Both,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum TestItem {
     NeedsFocus,
     ChaosMode,
     WrCapture,
     WrCaptureRef,
     NoAutoFuzz,
+    Pref(PrefItemLocation, String, String),
     Status(Status, Option<Condition>),
     Slow(Option<Condition>),
     Asserts(Option<Condition>, URange),
     Fuzzy(Option<Condition>, URange, URange),
     RequireOr(Condition, Status),
+}
+
+#[derive(PartialEq)]
+enum IsRedundant { No, Yes }
+
+fn simplify_cond(cond: &mut Option<Condition>) -> IsRedundant {
+    if let Some(ref mut c) = *cond {
+        c.simplify();
+        match c.known_value() {
+            Some(true) => {},
+            Some(false) => return IsRedundant::Yes,
+            None => return IsRedundant::No,
+        }
+    }
+    *cond = None;
+    IsRedundant::No
+}
+
+impl TestItem {
+    // Returns whether the item is completely redundant.
+    fn simplify(&mut self) -> IsRedundant {
+        match *self {
+            Self::NeedsFocus |
+            Self::ChaosMode |
+            Self::WrCapture |
+            Self::WrCaptureRef |
+            Self::Pref(..) |
+            Self::NoAutoFuzz => IsRedundant::No,
+            Self::Status(.., ref mut cond) |
+            Self::Slow(ref mut cond) |
+            Self::Fuzzy(ref mut cond, ..) |
+            Self::Asserts(ref mut cond, ..) => simplify_cond(cond),
+            Self::RequireOr(ref mut cond, status) => {
+                cond.simplify();
+                match cond.known_value() {
+                    Some(true) => {
+                        *self = Self::Status(status, None);
+                        IsRedundant::No
+                    },
+                    None => IsRedundant::No,
+                    Some(false) => IsRedundant::Yes,
+                }
+            }
+        }
+    }
 }
 
 fn parse_function<'a>(name: &str, mut item: &'a str) -> Result<&'a str, ()> {
@@ -221,10 +332,25 @@ fn parse_maybe_conditional(name: &str, mut item: &str) -> Result<Option<Conditio
     Ok(Some(Condition::parse(condition.as_bytes())))
 }
 
+fn parse_pref_function(item: &str) -> Option<(PrefItemLocation, &str, &str)> {
+    let (location, arguments) = match parse_function("pref", item) {
+        Ok(arguments) => (PrefItemLocation::Both, arguments),
+        Err(()) => match parse_function("test-pref", item) {
+            Ok(arguments) => (PrefItemLocation::Test, arguments),
+            Err(()) => (PrefItemLocation::Ref, parse_function("ref-pref", item).ok()?),
+        }
+    };
+
+    let name_end = find_comma_in_scope(arguments)?;
+    let name = &arguments[..name_end];
+    let value = &arguments[name_end + 1..];
+    Some((location, name, value))
+}
+
 impl TestItem {
     fn from_str(item: &str) -> Option<Self> {
         if let Ok(condition) = parse_maybe_conditional("fails", item) {
-            return Some(Self::Status(Status::Fail, condition));
+            return Some(Self::Status(Status::Fails, condition));
         }
         if let Ok(condition) = parse_maybe_conditional("random", item) {
             return Some(Self::Status(Status::Random, condition));
@@ -284,6 +410,9 @@ impl TestItem {
             let status = Status::from_str(&arguments[condition_end + 1..])?;
             return Some(Self::RequireOr(condition, status));
         }
+        if let Some((location, name, value)) = parse_pref_function(item) {
+            return Some(Self::Pref(location, name.into(), value.into()));
+        }
         Some(match item {
             "needs-focus" => Self::NeedsFocus,
             "chaos-mode" => Self::ChaosMode,
@@ -295,7 +424,7 @@ impl TestItem {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum TestType {
     Script(PathBuf),
     Load(PathBuf),
@@ -304,11 +433,19 @@ pub enum TestType {
     Print(PathBuf, PathBuf),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 struct Line<'a> {
     entry: Option<Entry>,
     #[allow(unused)]
     comment: &'a str,
+}
+
+impl<'a> Line<'a> {
+    pub fn simplify(&mut self) {
+        if let Some(ref mut entry) = self.entry {
+            entry.simplify();
+        }
+    }
 }
 
 fn parse_items(items: &[&str]) -> Vec<TestItem> {
@@ -352,7 +489,10 @@ fn maybe_parse_http(item: &str) -> Option<usize> {
 fn parse_manifest_line<'a>(mut line: &'a str) -> Result<Line<'a>, &'static str> {
     line = line.trim();
     let mut comment = "";
-    if let Some(pos) = line.find('#') {
+    if line.starts_with('#') {
+        comment = line;
+        line = "";
+    } else if let Some(pos) = line.find(" #") {
         comment = &line[pos..];
         line = &line[..pos];
     }
@@ -363,10 +503,6 @@ fn parse_manifest_line<'a>(mut line: &'a str) -> Result<Line<'a>, &'static str> 
             entry: None,
             comment,
         });
-    }
-
-    if items.len() == 1 {
-        return Err("At least two items in the line is needed");
     }
 
     {
@@ -475,13 +611,18 @@ pub fn parse_manifest(path: &Path) -> Result<Vec<Entry>, &'static str> {
         let line = line.expect("Error reading line");
         line_number += 1;
         match parse_manifest_line(&line) {
-            Ok(line) => {
+            Ok(mut line) => {
+                line.simplify();
                 if let Some(entry) = line.entry {
+                    if let Entry::Include(_, ref nested_path) = entry {
+                        let p = path.parent().unwrap().join(nested_path);
+                        parse_manifest(&p).unwrap();
+                    }
                     entries.push(entry);
                 }
             }
             Err(error) => {
-                eprintln!(
+                panic!(
                     "Failed to parse {}:{}: {}",
                     path.display(),
                     line_number,
@@ -494,7 +635,11 @@ pub fn parse_manifest(path: &Path) -> Result<Vec<Entry>, &'static str> {
     Ok(entries)
 }
 
-#[derive(Debug, PartialEq)]
+fn simplify_items(items: &mut Vec<TestItem>) {
+    items.retain_mut(|item| item.simplify() == IsRedundant::No)
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum Entry {
     /// An `include foo.list` statement, with out the entries from parsing that
     /// manifest.
@@ -502,6 +647,17 @@ pub enum Entry {
     UrlPrefix(String),
     Defaults(Vec<TestItem>),
     Test(Vec<TestItem>, IsHttp, TestType),
+}
+
+impl Entry {
+    fn simplify(&mut self) {
+        match *self {
+            Self::Defaults(ref mut items) |
+            Self::Test(ref mut items, ..) |
+            Self::Include(ref mut items, ..) => simplify_items(items),
+            Self::UrlPrefix(..) => {},
+        }
+    }
 }
 
 #[test]

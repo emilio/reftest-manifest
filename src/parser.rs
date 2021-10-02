@@ -4,8 +4,8 @@
 //!
 //! https://searchfox.org/mozilla-central/rev/79f93e7a8b9aa1903f1349f2dd46fb71596f2ae9/layout/tools/reftest/manifest.jsm#86
 
-use std::path::PathBuf;
 use retain_mut::RetainMut;
+use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum IsHttp {
@@ -22,7 +22,61 @@ pub enum Condition {
     Or(Vec<Condition>),
 }
 
+// Simplifies and and/or condition and, if it is redundant, returns the
+// simplified value.
+//
+// `redundant_value` the value that if known, can be omitted from the condition
+// (that is, true for && and false for ||).
+fn simplify_and_or(conds: &mut Vec<Condition>, redundant_value: bool) -> Option<Condition> {
+    let mut discarded = false;
+    conds.retain_mut(|cond| {
+        cond.simplify();
+        let known = cond.known_value();
+        discarded |= known == Some(!redundant_value);
+        known != Some(redundant_value)
+    });
+    if discarded {
+        Some(Condition::Simple(
+            if redundant_value { "false" } else { "true" }.into(),
+        ))
+    } else if conds.is_empty() {
+        Some(Condition::Simple(
+            if redundant_value { "true" } else { "false" }.into(),
+        ))
+    } else {
+        None
+    }
+}
+
 impl Condition {
+    fn serialize(&self, dest: &mut String) {
+        match *self {
+            Self::Simple(ref s) => dest.push_str(s),
+            Self::Neg(ref c) => {
+                dest.push('!');
+                c.serialize(dest);
+            }
+            Self::Paren(ref c) => {
+                dest.push('(');
+                c.serialize(dest);
+                dest.push(')');
+            }
+            Self::Or(ref conds) | Self::And(ref conds) => {
+                let operator = if matches!(*self, Self::And(..)) {
+                    "&&"
+                } else {
+                    "||"
+                };
+                for (i, cond) in conds.iter().enumerate() {
+                    if i != 0 {
+                        dest.push_str(operator);
+                    }
+                    cond.serialize(dest);
+                }
+            }
+        }
+    }
+
     fn known_value(&self) -> Option<bool> {
         match *self {
             Self::Simple(ref s) => {
@@ -33,7 +87,7 @@ impl Condition {
                     return Some(false);
                 }
                 None
-            },
+            }
             _ => None,
         }
     }
@@ -46,31 +100,26 @@ impl Condition {
                 if let Some(v) = inner.known_value() {
                     *self = Self::Simple(if v { "false" } else { "true" }.into())
                 }
-            },
+            }
             Self::Paren(ref mut inner) => {
                 inner.simplify();
                 if let Some(v) = inner.known_value() {
                     *self = Self::Simple(if v { "true" } else { "false" }.into())
+                } else if let Self::Simple(..) = **inner {
+                    let inner = std::mem::replace(&mut **inner, Condition::Simple(String::new()));
+                    *self = inner;
                 }
-            },
+            }
             Self::Or(ref mut conds) => {
-                conds.retain_mut(|cond| {
-                    cond.simplify();
-                    cond.known_value() != Some(false)
-                });
-                if conds.is_empty() {
-                    *self = Self::Simple("false".into());
+                if let Some(condition) = simplify_and_or(conds, false) {
+                    *self = condition;
                 }
-            },
+            }
             Self::And(ref mut conds) => {
-                conds.retain_mut(|cond| {
-                    cond.simplify();
-                    cond.known_value() != Some(true)
-                });
-                if conds.is_empty() {
-                    *self = Self::Simple("true".into());
+                if let Some(condition) = simplify_and_or(conds, true) {
+                    *self = condition;
                 }
-            },
+            }
         }
     }
 }
@@ -129,10 +178,7 @@ impl Condition {
 
             if let Some(op) = operator {
                 if op != condition[0] {
-                    eprintln!(
-                        "Operator conflict in {}",
-                        String::from_utf8_lossy(original)
-                    );
+                    eprintln!("Operator conflict in {}", String::from_utf8_lossy(original));
                     break;
                 }
             } else {
@@ -186,6 +232,14 @@ impl Condition {
 pub struct URange(usize, usize);
 
 impl URange {
+    fn serialize(&self, dest: &mut String, require_boundary: bool) {
+        use std::fmt::Write;
+        write!(dest, "{}", self.0).unwrap();
+        if require_boundary || self.0 != self.1 {
+            write!(dest, "-{}", self.1).unwrap();
+        }
+    }
+
     fn from_str(s: &str, require_boundary: bool) -> Option<URange> {
         let mut number_end = 0;
         let mut first_number_end = 0;
@@ -221,8 +275,6 @@ impl URange {
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Status {
-    #[allow(unused)]
-    Pass,
     Fails,
     Random,
     Skip,
@@ -230,8 +282,16 @@ pub enum Status {
 }
 
 impl Status {
+    fn as_str(&self) -> &'static str {
+        match *self {
+            Status::Fails => "fails",
+            Status::Random => "random",
+            Status::Skip => "skip",
+            Status::SilentFail => "silentfail",
+        }
+    }
+
     fn from_str(s: &str) -> Option<Status> {
-        // Pass is default.
         Some(match s {
             "fails" => Status::Fails,
             "random" => Status::Random,
@@ -265,13 +325,16 @@ pub enum TestItem {
 }
 
 #[derive(PartialEq)]
-enum IsRedundant { No, Yes }
+enum IsRedundant {
+    No,
+    Yes,
+}
 
 fn simplify_cond(cond: &mut Option<Condition>) -> IsRedundant {
     if let Some(ref mut c) = *cond {
         c.simplify();
         match c.known_value() {
-            Some(true) => {},
+            Some(true) => {}
             Some(false) => return IsRedundant::Yes,
             None => return IsRedundant::No,
         }
@@ -280,31 +343,145 @@ fn simplify_cond(cond: &mut Option<Condition>) -> IsRedundant {
     IsRedundant::No
 }
 
+bitflags::bitflags! {
+    struct ConditionalItemType : u8 {
+        const STATUS = 1 << 0;
+        const SLOW = 1 << 1;
+        const ASSERTS = 1 << 2;
+        const FUZZY = 1 << 3;
+        const REQUIRE_OR = 1 << 4;
+    }
+}
+
 impl TestItem {
-    fn serialize(&self, _dest: &mut String) {
-        todo!()
+    fn conditional_type(&self) -> ConditionalItemType {
+        match *self {
+            Self::NeedsFocus
+            | Self::ChaosMode
+            | Self::WrCapture
+            | Self::WrCaptureRef
+            | Self::NoAutoFuzz
+            | Self::Pref(..) => ConditionalItemType::empty(),
+
+            Self::Status(..) => ConditionalItemType::STATUS,
+            Self::Slow(..) => ConditionalItemType::SLOW,
+            Self::Asserts(..) => ConditionalItemType::ASSERTS,
+            Self::Fuzzy(..) => ConditionalItemType::FUZZY,
+            Self::RequireOr(..) => ConditionalItemType::REQUIRE_OR,
+        }
+    }
+
+    fn is_unconditional(&self) -> bool {
+        match *self {
+            Self::NeedsFocus
+            | Self::ChaosMode
+            | Self::WrCapture
+            | Self::WrCaptureRef
+            | Self::NoAutoFuzz
+            | Self::Pref(..) => true,
+
+            Self::Status(_, ref cond)
+            | Self::Slow(ref cond)
+            | Self::Asserts(ref cond, ..)
+            | Self::Fuzzy(ref cond, ..) => cond.is_none(),
+
+            Self::RequireOr(..) => false,
+        }
+    }
+
+    fn serialize(&self, dest: &mut String) {
+        match *self {
+            Self::NeedsFocus => dest.push_str("needs-focus"),
+            Self::ChaosMode => dest.push_str("chaos-mode"),
+            Self::WrCapture => dest.push_str("wr-capture"),
+            Self::WrCaptureRef => dest.push_str("wr-capture-ref"),
+            Self::NoAutoFuzz => dest.push_str("noautofuzz"),
+            Self::Status(ref status, ref cond) => {
+                dest.push_str(status.as_str());
+                if let Some(ref cond) = *cond {
+                    dest.push_str("-if(");
+                    cond.serialize(dest);
+                    dest.push(')');
+                }
+            }
+            Self::Slow(ref cond) => {
+                dest.push_str("slow");
+                if let Some(ref cond) = *cond {
+                    dest.push_str("-if(");
+                    cond.serialize(dest);
+                    dest.push(')');
+                }
+            }
+            Self::Asserts(ref cond, ref range) => {
+                dest.push_str("asserts");
+                if cond.is_some() {
+                    dest.push_str("-if");
+                }
+                dest.push('(');
+                if let Some(ref cond) = *cond {
+                    cond.serialize(dest);
+                    dest.push(',');
+                }
+                range.serialize(dest, /* require_boundary = */ false);
+                dest.push(')');
+            }
+            Self::Fuzzy(ref cond, ref num, ref diff) => {
+                dest.push_str("fuzzy");
+                if cond.is_some() {
+                    dest.push_str("-if");
+                }
+                dest.push('(');
+                if let Some(ref cond) = *cond {
+                    cond.serialize(dest);
+                    dest.push(',');
+                }
+                num.serialize(dest, /* require_boundary = */ true);
+                dest.push(',');
+                diff.serialize(dest, /* require_boundary = */ true);
+                dest.push(')');
+            }
+            Self::RequireOr(ref cond, status) => {
+                dest.push_str("require-or(");
+                cond.serialize(dest);
+                dest.push(',');
+                dest.push_str(status.as_str());
+                dest.push(')');
+            }
+            Self::Pref(ref location, ref name, ref value) => {
+                dest.push_str(match *location {
+                    PrefItemLocation::Ref => "ref-",
+                    PrefItemLocation::Test => "test-",
+                    PrefItemLocation::Both => "",
+                });
+                dest.push_str("pref(");
+                dest.push_str(name);
+                dest.push(',');
+                dest.push_str(value);
+                dest.push(')');
+            }
+        }
     }
 
     // Returns whether the item is completely redundant.
     fn simplify(&mut self) -> IsRedundant {
         match *self {
-            Self::NeedsFocus |
-            Self::ChaosMode |
-            Self::WrCapture |
-            Self::WrCaptureRef |
-            Self::Pref(..) |
-            Self::NoAutoFuzz => IsRedundant::No,
-            Self::Status(.., ref mut cond) |
-            Self::Slow(ref mut cond) |
-            Self::Fuzzy(ref mut cond, ..) |
-            Self::Asserts(ref mut cond, ..) => simplify_cond(cond),
+            Self::NeedsFocus
+            | Self::ChaosMode
+            | Self::WrCapture
+            | Self::WrCaptureRef
+            | Self::Pref(..)
+            | Self::NoAutoFuzz => IsRedundant::No,
+            Self::Status(.., ref mut cond)
+            | Self::Slow(ref mut cond)
+            | Self::Fuzzy(ref mut cond, ..)
+            | Self::Asserts(ref mut cond, ..) => simplify_cond(cond),
             Self::RequireOr(ref mut cond, status) => {
                 cond.simplify();
                 match cond.known_value() {
                     Some(true) => {
                         *self = Self::Status(status, None);
                         IsRedundant::No
-                    },
+                    }
                     None => IsRedundant::No,
                     Some(false) => IsRedundant::Yes,
                 }
@@ -341,8 +518,11 @@ fn parse_pref_function(item: &str) -> Option<(PrefItemLocation, &str, &str)> {
         Ok(arguments) => (PrefItemLocation::Both, arguments),
         Err(()) => match parse_function("test-pref", item) {
             Ok(arguments) => (PrefItemLocation::Test, arguments),
-            Err(()) => (PrefItemLocation::Ref, parse_function("ref-pref", item).ok()?),
-        }
+            Err(()) => (
+                PrefItemLocation::Ref,
+                parse_function("ref-pref", item).ok()?,
+            ),
+        },
     };
 
     let name_end = find_comma_in_scope(arguments)?;
@@ -438,8 +618,21 @@ pub enum TestType {
 }
 
 impl TestType {
-    fn serialize(&self, _dest: &mut String) {
-        todo!()
+    fn serialize(&self, dest: &mut String) {
+        let (name, first, second) = match *self {
+            Self::Script(ref p) => ("script", p, None),
+            Self::Load(ref p) => ("load", p, None),
+            Self::Equals(ref t, ref r) => ("==", t, Some(r)),
+            Self::Unequals(ref t, ref r) => ("!=", t, Some(r)),
+            Self::Print(ref t, ref r) => ("print", t, Some(r)),
+        };
+        dest.push_str(name);
+        dest.push(' ');
+        dest.push_str(first.to_str().unwrap());
+        if let Some(second) = second {
+            dest.push(' ');
+            dest.push_str(second.to_str().unwrap());
+        }
     }
 }
 
@@ -616,7 +809,30 @@ pub fn parse_manifest_line<'a>(mut line: &'a str) -> Result<Line<'a>, &'static s
 }
 
 fn simplify_items(items: &mut Vec<TestItem>) {
-    items.retain_mut(|item| item.simplify() == IsRedundant::No)
+    // We iterate in reverse, to remove conditional items that won't ever be
+    // handled, e.g. the fuzzy-if in:
+    //
+    //   fuzzy-if(foo,...) fuzzy(..)
+    let mut indices_to_remove = vec![];
+    let mut unconditional_types = ConditionalItemType::empty();
+    for (i, item) in items.iter_mut().enumerate().rev() {
+        let conditional_type = item.conditional_type();
+        if unconditional_types.intersects(conditional_type) {
+            indices_to_remove.push(i);
+            continue;
+        }
+        if item.simplify() == IsRedundant::Yes {
+            indices_to_remove.push(i);
+            continue;
+        }
+        if item.is_unconditional() {
+            unconditional_types |= conditional_type;
+        }
+    }
+
+    for i in indices_to_remove {
+        items.remove(i);
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -641,10 +857,10 @@ fn serialize_items(items: &[TestItem], dest: &mut String) {
 impl Entry {
     fn simplify(&mut self) {
         match *self {
-            Self::Defaults(ref mut items) |
-            Self::Test(ref mut items, ..) |
-            Self::Include(ref mut items, ..) => simplify_items(items),
-            Self::UrlPrefix(..) => {},
+            Self::Defaults(ref mut items)
+            | Self::Test(ref mut items, ..)
+            | Self::Include(ref mut items, ..) => simplify_items(items),
+            Self::UrlPrefix(..) => {}
         }
     }
 
@@ -663,12 +879,15 @@ impl Entry {
                     dest.push(' ');
                 }
                 dest.push_str("include ");
-                dest.push_str(path.to_str().expect("should be able to serialize a path that came from a string"));
-            },
+                dest.push_str(
+                    path.to_str()
+                        .expect("should be able to serialize a path that came from a string"),
+                );
+            }
             Self::UrlPrefix(ref prefix) => {
                 dest.push_str("url-prefix ");
                 dest.push_str(prefix)
-            },
+            }
             Self::Test(ref items, ref is_http, ref test_type) => {
                 if !items.is_empty() {
                     serialize_items(&items, dest);
@@ -719,4 +938,25 @@ fn test_parsing() {
             comment: "",
         })
     )
+}
+
+#[test]
+fn test_simplify() {
+    macro_rules! test_simplified_line {
+        ($line:expr, $expected:expr) => {{
+            let mut line = parse_manifest_line($line).unwrap();
+            line.simplify();
+            assert_eq!(line.serialize(), $expected);
+        }};
+    }
+
+    test_simplified_line!(
+        "fails-if(Android&&!true) == foo.html bar.html",
+        "== foo.html bar.html"
+    );
+
+    test_simplified_line!(
+        "fails-if(somethingElse) fails-if(Android||true) == foo.html bar.html",
+        "fails == foo.html bar.html"
+    );
 }

@@ -7,3 +7,4 @@ edition = "2018"
 
 [dependencies]
 retain_mut = "0.1"
+bitflags = "1.0"

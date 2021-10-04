@@ -30,7 +30,7 @@ pub enum Condition {
 fn simplify_and_or(conds: &mut Vec<Condition>, redundant_value: bool) -> Option<Condition> {
     let mut discarded = false;
     conds.retain_mut(|cond| {
-        cond.simplify();
+        cond.simplify_internal();
         let known = cond.known_value();
         discarded |= known == Some(!redundant_value);
         known != Some(redundant_value)
@@ -43,6 +43,10 @@ fn simplify_and_or(conds: &mut Vec<Condition>, redundant_value: bool) -> Option<
         Some(Condition::Simple(
             if redundant_value { "true" } else { "false" }.into(),
         ))
+    } else if conds.len() == 1 {
+        let mut cond = conds.drain(..).next().unwrap();
+        cond.peel_parens();
+        Some(cond)
     } else {
         None
     }
@@ -92,17 +96,29 @@ impl Condition {
         }
     }
 
+    fn peel_parens(&mut self) {
+        while let Self::Paren(ref mut inner) = *self {
+            let inner = std::mem::replace(&mut **inner, Condition::Simple(String::new()));
+            *self = inner;
+        }
+    }
+
     fn simplify(&mut self) {
+        self.simplify_internal();
+        self.peel_parens();
+    }
+
+    fn simplify_internal(&mut self) {
         match *self {
             Self::Simple(..) => return,
             Self::Neg(ref mut inner) => {
-                inner.simplify();
+                inner.simplify_internal();
                 if let Some(v) = inner.known_value() {
                     *self = Self::Simple(if v { "false" } else { "true" }.into())
                 }
             }
             Self::Paren(ref mut inner) => {
-                inner.simplify();
+                inner.simplify_internal();
                 if let Some(v) = inner.known_value() {
                     *self = Self::Simple(if v { "true" } else { "false" }.into())
                 } else if let Self::Simple(..) = **inner {
@@ -332,7 +348,7 @@ enum IsRedundant {
 
 fn simplify_cond(cond: &mut Option<Condition>) -> IsRedundant {
     if let Some(ref mut c) = *cond {
-        c.simplify();
+        c.simplify_internal();
         match c.known_value() {
             Some(true) => {}
             Some(false) => return IsRedundant::Yes,
@@ -958,5 +974,16 @@ fn test_simplify() {
     test_simplified_line!(
         "fails-if(somethingElse) fails-if(Android||true) == foo.html bar.html",
         "fails == foo.html bar.html"
+    );
+
+    test_simplified_line!(
+        "skip-if((something||otherthing)&&true) == foo.html bar.html",
+        "skip-if(something||otherthing) == foo.html bar.html"
+    );
+
+
+    test_simplified_line!(
+        "skip-if(isDebugBuild||(winWidget&&(!is64Bit))) == 256180-2.html 256180-2-ref.html",
+        "skip-if(isDebugBuild||(winWidget&&(!is64Bit))) == 256180-2.html 256180-2-ref.html"
     );
 }

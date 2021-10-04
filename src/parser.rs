@@ -84,7 +84,7 @@ impl Condition {
     fn known_value(&self) -> Option<bool> {
         match *self {
             Self::Simple(ref s) => {
-                if s == "true" || s == "webrender" {
+                if s == "true" || s == "webrender" || s == "skiaContent" {
                     return Some(true);
                 }
                 if s == "false" {

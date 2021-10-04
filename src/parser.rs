@@ -981,7 +981,6 @@ fn test_simplify() {
         "skip-if(something||otherthing) == foo.html bar.html"
     );
 
-
     test_simplified_line!(
         "skip-if(isDebugBuild||(winWidget&&(!is64Bit))) == 256180-2.html 256180-2-ref.html",
         "skip-if(isDebugBuild||(winWidget&&(!is64Bit))) == 256180-2.html 256180-2-ref.html"

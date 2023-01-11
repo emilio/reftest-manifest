@@ -4,7 +4,6 @@
 //!
 //! https://searchfox.org/mozilla-central/rev/79f93e7a8b9aa1903f1349f2dd46fb71596f2ae9/layout/tools/reftest/manifest.jsm#86
 
-use retain_mut::RetainMut;
 use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -87,7 +86,7 @@ impl Condition {
                 if s == "true" || s == "webrender" || s == "skiaContent" {
                     return Some(true);
                 }
-                if s == "false" {
+                if s == "false" || s == "nativeThemePref" {
                     return Some(false);
                 }
                 None

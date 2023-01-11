@@ -6,5 +6,4 @@ license = "MIT"
 authors = ["Emilio Cobos Álvarez <emilio@crisal.io>"]
 
 [dependencies]
-retain_mut = "0.1"
 bitflags = "1.0"
